@@ -6,7 +6,10 @@ import React from "react";
 
 function inline(text: string, key = 0): React.ReactNode[] {
   const out: React.ReactNode[] = [];
-  const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s][^*]*\*|_[^_\s][^_]*_|\[[^\]]+\]\((https?:[^)\s]+)\))/g;
+  // Emphasis must hug its text (`*word*`, not `a * b * c`), and `_x_` only counts at word
+  // boundaries, so snake_case identifiers like max_retry_count stay intact.
+  const re =
+    /(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s](?:[^*]*[^*\s])?\*|(?<![\p{L}\p{N}_])_[^_\s](?:[^_]*[^_\s])?_(?![\p{L}\p{N}_])|\[[^\]]+\]\((https?:[^)\s]+)\))/gu;
   let last = 0;
   let m: RegExpExecArray | null;
   let i = 0;

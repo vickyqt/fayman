@@ -8,6 +8,9 @@
  *   npm run ingest              # all repos
  *   npm run ingest -- docker    # only repos whose name contains "docker"
  *   GITHUB_TOKEN=... npm run ingest   # higher rate limits
+ *
+ * Never fails the process: a repo that can't be fetched is skipped (keeping
+ * its previously ingested files, if any), so it is safe in a deploy build.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -19,13 +22,15 @@ const headers = { "user-agent": "feynman-lab-ingest", accept: "application/vnd.g
 if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
 
 async function gh(url) {
-  const res = await fetch(url, { headers });
+  const res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) });
   if (!res.ok) throw new Error(`${res.status} ${url}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
 
 function titleOf(text, file) {
-  const fm = text.match(/^---\n[\s\S]*?\ntitle:\s*["']?(.+?)["']?\n[\s\S]*?\n---/);
+  // `title:` may be the first frontmatter line (MDN, react.dev), so search the block line by line.
+  const block = text.match(/^---\n([\s\S]*?)\n---/)?.[1];
+  const fm = block?.match(/^title:\s*["']?(.+?)["']?\s*$/m);
   if (fm) return fm[1];
   const h = text.match(/^#\s+(.+)$/m);
   return h ? h[1].trim() : path.basename(file);
@@ -33,18 +38,34 @@ function titleOf(text, file) {
 
 const outFile = path.join(root, "data/corpus.json");
 let existing = [];
-if (filter && fs.existsSync(outFile)) existing = JSON.parse(fs.readFileSync(outFile, "utf8"));
+try {
+  if (fs.existsSync(outFile)) existing = JSON.parse(fs.readFileSync(outFile, "utf8"));
+} catch (e) {
+  console.warn(`Ignoring unreadable ${outFile}: ${e.message}`);
+}
 
-const docs = existing.filter((d) => !d.repo.toLowerCase().includes(filter ?? "\u0000"));
+// Repos outside the filter keep their documents; so does any repo whose re-ingest fails below.
+const docs = existing.filter((d) => filter && !d.repo.toLowerCase().includes(filter));
+const keepOld = (repo) => {
+  const old = existing.filter((d) => d.repo === repo);
+  if (old.length) {
+    docs.push(...old);
+    console.warn(`  kept ${old.length} previously ingested file(s) for ${repo}`);
+  }
+};
+
 async function fetchRaw(repo, branch, file) {
   const res = await fetch(`https://raw.githubusercontent.com/${repo}/${branch}/${file}`, {
     headers: { "user-agent": headers["user-agent"] },
+    signal: AbortSignal.timeout(20_000), // never hang a deploy build on one slow file
   });
-  return res.ok ? res.text() : null;
+  // Normalise line endings so frontmatter and heading parsing behave the same everywhere.
+  return res.ok ? (await res.text()).replace(/\r\n?/g, "\n") : null;
 }
 
 for (const entry of cfg.repos) {
   if (filter && !entry.repo.toLowerCase().includes(filter)) continue;
+  const before = docs.length;
   try {
     const exactFiles = (entry.include ?? []).filter((p) => /\.mdx?$/i.test(p));
     const prefixes = (entry.include ?? []).filter((p) => !/\.mdx?$/i.test(p));
@@ -85,9 +106,12 @@ for (const entry of cfg.repos) {
       });
       count++;
     }
-    console.log(`✓ ${entry.repo}@${branch}: ${count} file(s)`);
+    console.log(`${count ? "✓" : "✗"} ${entry.repo}@${branch}: ${count} file(s)`);
+    if (!count) keepOld(entry.repo);
   } catch (e) {
     console.warn(`✗ ${entry.repo}: ${e.message.slice(0, 160)}`);
+    docs.length = before;
+    keepOld(entry.repo);
   }
 }
 

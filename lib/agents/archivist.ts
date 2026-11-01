@@ -4,7 +4,7 @@
  * the hidden ground-truth rubric for the Pupil, and extracts short notes.
  */
 import { completeJSON, isMock } from "@/lib/llm";
-import { contextPool, retrieve, type Chunk } from "@/lib/retrieval";
+import { contextPool, retrieve, tokenize, type Chunk } from "@/lib/retrieval";
 import {
   NoteDraft,
   Rubric,
@@ -81,31 +81,77 @@ export async function buildRubric(
   chunks: Chunk[],
   grounding: Grounding = "sources",
 ): Promise<RubricItem[]> {
+  if (!lesson.blocks.length) throw new Error("Cannot write a rubric for a lesson with no blocks");
   const valid = new Set(lesson.blocks.map((b) => b.id));
   // Lessons can be trimmed (length / interactivity options), so re-point items at blocks that exist.
   const fixBlockId = (id: string) => (valid.has(id) ? id : lesson.blocks[0].id);
   if (isMock()) return tcpRubric.map(({ misconceptions: _m, ...item }) => ({ ...item, blockId: fixBlockId(item.blockId) }));
   const blocks = lesson.blocks.map((b) => `- ${b.id} (${b.type}): ${b.title}`).join("\n");
-  const out = await completeJSON(
-    {
-      tag: "archivist.rubric",
-      system: `${RUBRIC_SYSTEM}\n${groundingRules(grounding)}`,
-      maxTokens: 2000,
-      temperature: 0.2,
-      messages: [
-        {
-          role: "user",
-          content: `TOPIC: ${topic}\n\nLESSON BLOCKS:\n${blocks}\n\nSOURCES:\n${formatContext(chunks)}`,
-        },
-      ],
-    },
-    Rubric,
-  );
-  return out.items.map((it) => ({
-    ...it,
-    keywords: it.keywords.map((k) => k.toLowerCase()),
-    blockId: fixBlockId(it.blockId),
-  }));
+  try {
+    const out = await completeJSON(
+      {
+        tag: "archivist.rubric",
+        system: `${RUBRIC_SYSTEM}\n${groundingRules(grounding)}`,
+        maxTokens: 2000,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "user",
+            content: `TOPIC: ${topic}\n\nLESSON BLOCKS:\n${blocks}\n\nSOURCES:\n${formatContext(chunks)}`,
+          },
+        ],
+      },
+      Rubric,
+    );
+    // Statuses are keyed by item id, so duplicates would share (and overwrite) one status.
+    const seen = new Set<string>();
+    return out.items.map((it) => {
+      let id = it.id;
+      for (let n = 2; seen.has(id); n++) id = `${it.id.slice(0, 60)}-${n}`;
+      seen.add(id);
+      return { ...it, id, keywords: it.keywords.map((k) => k.toLowerCase()), blockId: fixBlockId(it.blockId) };
+    });
+  } catch (e) {
+    // The lesson is already built; a plainer rubric beats failing the whole request.
+    console.warn("[archivist] rubric fallback:", (e as Error).message);
+    return fallbackRubric(lesson);
+  }
+}
+
+/** The single main claim of a block, for the deterministic fallback rubric. */
+function mainClaim(b: LessonBlock): string {
+  switch (b.type) {
+    case "concept":
+      return b.keyPoints[0] ?? b.body;
+    case "slider":
+      return b.insight;
+    case "stepper":
+    case "architecture":
+      return b.description;
+    case "code":
+      return b.trace.map((t) => t.note).join(" ");
+    case "predict":
+      return `${b.options[b.correctIndex]}. ${b.explanation}`;
+  }
+}
+
+/** Deterministic rubric (one item per block, up to 7) used when the LLM rubric fails. */
+export function fallbackRubric(lesson: LessonDraft): RubricItem[] {
+  const picked = lesson.blocks.slice(0, 7);
+  return picked.map((b, i) => {
+    const claim = mainClaim(b).replace(/[*`#>]/g, "").replace(/\s+/g, " ").trim();
+    const sentence = (claim.match(/^.+?[.!?](\s|$)/)?.[0] ?? claim).trim();
+    const keywords = [...new Set(tokenize(`${b.title} ${sentence}`).filter((t) => t.length > 3 && t.length <= 40))].slice(0, 6);
+    const tier = i < Math.ceil(picked.length / 3) ? "easy" : i < picked.length - 1 || picked.length < 3 ? "medium" : "difficult";
+    return {
+      id: `r-${b.id}`.slice(0, 64),
+      concept: b.title,
+      expectation: `Explain in your own words: ${sentence || b.title}`.slice(0, 500),
+      keywords: keywords.length ? keywords : [b.title.toLowerCase().slice(0, 40)],
+      tier,
+      blockId: b.id,
+    };
+  });
 }
 
 /* ---------------- notes ---------------- */

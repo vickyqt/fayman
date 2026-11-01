@@ -17,6 +17,7 @@ import type {
   Scorecard,
 } from "@/lib/schemas";
 import { DEFAULT_OPTIONS, withDefaults } from "@/lib/lesson-options";
+import { LIMITS } from "@/lib/limits";
 
 export interface Note {
   id: string;
@@ -94,6 +95,15 @@ export function listFolders(): Folder[] {
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+/**
+ * The topic to open a folder with. It must slugify back to the folder's slug;
+ * older versions saved the offline demo's lesson title instead, so fall back to
+ * the slug itself for those.
+ */
+export function folderTopic(f: Folder): string {
+  return slugify(f.topic) === f.slug ? f.topic : f.slug.replace(/-/g, " ");
+}
+
 export function getFolder(topic: string): Folder {
   const slug = slugify(topic);
   return read<Folder>(`folder:${slug}`, { slug, topic, notes: [], scores: [], updatedAt: new Date().toISOString() });
@@ -143,7 +153,13 @@ export function setPrefs(o: LessonOptions) {
 /* uploaded study material (kept for the browser session) */
 export function getUploads(): ExtraDoc[] {
   try {
-    return JSON.parse(sessionStorage.getItem(P + "uploads") || "[]");
+    const docs: unknown = JSON.parse(sessionStorage.getItem(P + "uploads") || "[]");
+    if (!Array.isArray(docs)) return [];
+    // Never send more than the server accepts (older versions stored unlimited uploads).
+    return docs
+      .filter((d): d is ExtraDoc => typeof d?.name === "string" && typeof d?.text === "string")
+      .slice(0, LIMITS.uploads)
+      .map((d) => ({ name: d.name.slice(0, 200), text: d.text.slice(0, LIMITS.uploadChars) }));
   } catch {
     return [];
   }

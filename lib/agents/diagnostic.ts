@@ -41,14 +41,16 @@ export async function generateQuestions(
     },
     DiagnosticSet,
   );
-  return out.questions.map((q) => ({ ...q, correctIndex: Math.min(q.correctIndex, q.options.length - 1) }));
+  // Answers are keyed by question id, so ids must be unique: renumber them d1..dn.
+  return out.questions.map((q, i) => ({ ...q, id: `d${i + 1}`, correctIndex: Math.min(q.correctIndex, q.options.length - 1) }));
 }
 
 function grade(questions: DiagnosticQuestion[], answers: DiagnosticAnswer[]) {
   const byId = new Map(answers.map((a) => [a.questionId, a]));
   const rows = questions.map((q) => {
     const a = byId.get(q.id);
-    const choice = a?.choice ?? -1;
+    // Anything outside the option list counts as "I'm not sure".
+    const choice = a && a.choice >= 0 && a.choice < q.options.length ? a.choice : -1;
     return {
       q,
       choice,

@@ -7,6 +7,7 @@
  * renderer maps onto the 5-color palette (valid → green, error → red, ...).
  */
 import { z } from "zod";
+import { LIMITS } from "@/lib/limits";
 
 /* ---------- shared ---------- */
 
@@ -75,7 +76,7 @@ export const DiagnosticSet = z.object({
 export const DiagnosticAnswer = z.object({
   questionId: id,
   choice: z.number().int().min(-1), // -1 = "I'm not sure"
-  explanation: z.string().max(1000).optional().default(""),
+  explanation: z.string().max(LIMITS.diagnosticWhy).optional().default(""),
 });
 export type DiagnosticAnswer = z.infer<typeof DiagnosticAnswer>;
 
@@ -288,7 +289,7 @@ export type RubricStatus = "pending" | "mastered" | "gap";
 
 export const TranscriptMsg = z.object({
   role: z.enum(["learner", "pupil"]),
-  text: z.string().max(4000),
+  text: z.string().max(LIMITS.message),
   targetId: z.string().optional(),
 });
 export type TranscriptMsg = z.infer<typeof TranscriptMsg>;
@@ -350,6 +351,6 @@ export type NoteDraft = z.infer<typeof NoteDraft>;
 
 export const ExtraDoc = z.object({
   name: z.string().max(200),
-  text: z.string().max(200_000),
+  text: z.string().max(LIMITS.uploadChars),
 });
 export type ExtraDoc = z.infer<typeof ExtraDoc>;

@@ -1,14 +1,15 @@
 # Feynman Lab — Architecture
 
 > Snapshot of the codebase as of 2026-11-01 (v0.1.0, hackathon MVP), including any-topic web grounding,
-> learner lesson options, ✦ reimagine, dark mode and the voice fixes.
+> learner lesson options, ✦ reimagine, dark mode, the voice fixes, the Next 16 / zod 4 upgrade, per-request time
+> budgets and the Vercel deployment setup.
 > For setup and usage, see `README.md`. This document explains **how the system is put together and why**.
 
 ---
 
 ## 1. What the system does
 
-Feynman Lab is a single Next.js 15 app that runs a two-phase learning loop for any technical topic:
+Feynman Lab is a single Next.js 16 app that runs a two-phase learning loop for any technical topic:
 
 1. **Learn by doing.** A diagnostic calibrates the learner, who then picks the lesson's length, depth and amount of
    interactive content. An LLM "Teacher" generates an interactive lesson grounded in trusted repos and the web:
@@ -27,9 +28,10 @@ React components (Server-Driven UI).
 
 | Concern | Choice | Notes |
 |---|---|---|
-| Framework | Next.js 15 (App Router), React 19 | One deployable; pages + API route handlers |
+| Framework | Next.js 16 (App Router, Turbopack), React 19 | One deployable; pages + API route handlers. Node ≥ 20.9 |
 | Language | TypeScript (strict) | Path alias `@/*` → project root |
-| Validation | zod 3 | Every API request **and** every LLM response |
+| Validation | zod 4 | Every API request **and** every LLM response |
+| Hosting | Vercel (Next.js preset, Fluid compute) | See README "Deploy on Vercel" |
 | Diagrams | `@xyflow/react` (React Flow 12) | Only used by `DraggableArchitectureCanvas` |
 | LLM access | Plain `fetch` adapters | No vendor SDKs. Anthropic, OpenAI, Gemini, OpenAI-compatible, mock |
 | Retrieval | Hand-written BM25 + Wikipedia search | In-process, zero dependencies; web search is keyless and skipped offline |
@@ -118,12 +120,12 @@ app/
   api/
     status/route.ts          GET  provider/model + corpus stats
     diagnostic/route.ts      POST start diagnostic           (maxDuration 60s)
-    lesson/route.ts          POST build lesson + rubric      (maxDuration 120s)
-    reimagine/route.ts       POST ✦ rewrite one block or the whole lesson (maxDuration 120s)
+    lesson/route.ts          POST build lesson + rubric      (maxDuration 300s)
+    reimagine/route.ts       POST ✦ rewrite one block or the whole lesson (maxDuration 300s)
     pupil/route.ts           POST one teach-back turn        (maxDuration 60s)
     scorecard/route.ts       POST finish teach-back          (maxDuration 60s)
     notes/route.ts           POST extract a note from a block (maxDuration 30s)
-    dispute/route.ts         POST learner flag / grading dispute (maxDuration 90s)
+    dispute/route.ts         POST learner flag / grading dispute (maxDuration 120s)
 
 components/
   ThemeToggle.tsx            Auto → Light → Dark cycle button
@@ -145,11 +147,12 @@ components/
 lib/
   orchestrator.ts            Sequences the agents per use case
   lesson-options.ts          Meaning of Length / Depth / Interactivity + shared diagnostic scoring (isomorphic)
+  limits.ts                  Request size limits shared by api-schemas and the UI (isomorphic)
   theme-script.ts            Pre-paint theme script inlined in <head>
   schemas/index.ts           zod contracts for every artifact (the SDUI contract)
   api-schemas.ts             zod request bodies for routes
-  http.ts                    Route wrapper: JSON parse → validate → run → error mapping
-  llm/index.ts               Provider adapters, complete(), completeJSON() with self-repair
+  http.ts                    Route wrapper: JSON parse → validate → run inside the route's time budget → error mapping
+  llm/index.ts               Provider adapters, complete(), completeJSON() with self-repair, time budget (timeLeft)
   retrieval/index.ts         Heading-anchored chunking, BM25, corpus loading, per-request pool + cached merged index
   retrieval/web.ts           Wikipedia search → SourceDocs (cached per topic)
   expr.ts                    Sandboxed arithmetic/boolean expression parser + evaluator
@@ -266,8 +269,11 @@ sequenceDiagram
 ```
 
 With a real provider, a lesson costs **4 + N LLM calls**: profile, lesson, fidelity, rubric, plus one regeneration per
-unsupported block. Each call can retry up to twice on validation failure. This is why the route has a 120 s
-`maxDuration`.
+unsupported block. Each call can retry up to twice on validation failure. This is why the route has a 300 s
+`maxDuration`, and why the work runs inside a **time budget** (§8): the fidelity audit only starts with ≥ 75 s left
+and regeneration with ≥ 60 s, otherwise they are recorded in `guardReport.skippedForTime`. If every block fails the
+structural checks the request fails with a clear 502. If the rubric call fails, `fallbackRubric()` derives one item
+per block deterministically, so a finished lesson is never thrown away.
 
 ### 7.3 Teach-back: `POST /api/pupil` and `POST /api/scorecard`
 
@@ -276,14 +282,18 @@ unsupported block. Each call can retry up to twice on validation failure. This i
   if no learner message yet → pupilOpening()           (no LLM)
   else Pupil.pupilTurn()                                LLM with hidden rubric in system prompt
      → Guardrail.auditPupilTurn()                       drop unknown ids; drop "mastered" unless
-                                                        ≥ 50% of evidence tokens appear in the learner's words
+                                                        ≥ 50% of evidence tokens appear in the learner's words;
+                                                        drop "gap" unless the item was just asked about, or the
+                                                        quoted evidence comes from the latest learner message
   ← PupilTurn
 
 scorecard: score computed deterministically; LLM only writes summary / gapWhy / nextSteps
 ```
 
-The server is **stateless** here. The client sends the full rubric, current statuses and transcript (≤ 80 messages)
-on every turn, and the client merges the returned `updates` into its statuses.
+The server is **stateless** here. The client sends the full rubric, current statuses and the most recent 80 transcript
+messages on every turn (the server also trims anything longer instead of rejecting it), and the client merges the
+returned `updates` into its statuses. Statuses carry the progress from older messages, so long teach-backs keep working.
+The mock Pupil re-probes red items after the pending ones and only says "press Finish" once everything is mastered.
 
 ### 7.4 Reimagine (✦): `POST /api/reimagine`
 
@@ -316,9 +326,10 @@ kind = "grading" ("Unfair?" on a red rubric item)
 
   → gatherContext(k=10) + the block's own cited chunks
   → Guardrail.resolveDispute()      LLM verdict (mock: always regenerates blocks; keyword re-grade for grading)
+  → normalizeVerdict()              rejected → no action; block flags never regrade; grading never regenerates
       regenerate_block   → Architect.regenerateBlock → guardLesson (single block)
       rubricPatch        → patched RubricItem
-      regradeTo          → client overwrites that item's status
+      regradeTo          → client overwrites that item's status (only when upheld)
   → append to data/disputes.jsonl (best effort; console log otherwise)
 ```
 
@@ -330,8 +341,14 @@ The client swaps the returned block or rubric item into its session, persists it
 
 - **Provider selection:** `LLM_PROVIDER` ∈ `mock | anthropic | openai | gemini | openai-compatible`. Unknown values fall back
   to `mock`. `LLM_MODEL` overrides the per-provider default.
-- **Transport:** `postJSON` with a 90 s `AbortController` timeout. Non-2xx responses throw `LLMError`, which
-  `lib/http.ts` maps to **HTTP 502** (other errors → 500).
+- **Transport:** `postJSON` with an `AbortController` timeout. Non-2xx responses, timeouts and network failures all
+  throw `LLMError` with a readable message, which `lib/http.ts` maps to **HTTP 502** (other errors → 500).
+- **Time budget:** `handler(schema, fn, { maxDuration })` runs each request inside `withTimeBudget()` (an
+  `AsyncLocalStorage` deadline = `maxDuration` − 8 s). The per-call timeout scales with `maxTokens`
+  (`30 s + 20 ms/token`, clamped to 60–240 s, or `LLM_TIMEOUT_MS`) and is capped by `timeLeft()`. A call that can't
+  start with at least 8 s left fails fast, and self-repair retries stop when less than 20 s remain.
+- **OpenAI specifics:** `api.openai.com` gets `max_completion_tokens` (compatible servers keep `max_tokens`), and
+  reasoning models (`o*`, `gpt-5*`) are sent no temperature.
 - **`completeJSON(req, schema, retries=2)`** is the backbone of output safety:
   1. Call the provider, asking for JSON mode where the provider supports it (OpenAI `response_format`, Gemini `responseMimeType`).
   2. `extractJSON` pulls the first `{…}` object out of the reply, tolerating code fences and preambles.
@@ -359,7 +376,8 @@ generation, 0.6 for the Pupil persona.
 
 ### Chunking
 
-- Split on Markdown headings `#`–`####`, ignoring headings inside code fences.
+- Seed frontmatter is parsed after normalising CRLF line endings (Windows checkouts with `core.autocrlf`).
+- Split on Markdown headings `#`–`####`, ignoring headings inside ```` ``` ```` / `~~~` code fences.
 - Chunk id = `<docId>#<github-slug>` (`~n` suffix when a section is split at about 1600 chars on paragraph boundaries).
 - Chunk URL = the GitHub blob URL plus the heading anchor. A `<!-- source: URL -->` comment inside a section overrides
   it (the seed notes use this to cite RFC sections).
@@ -368,6 +386,7 @@ generation, 0.6 for the Pupil persona.
 ### Ranking
 
 BM25 with k1 = 1.4 and b = 0.75. Headings are counted twice to boost them, and there is a small stop-word list.
+Tokens are Unicode letters/digits, so non-English Wikipedia editions rank properly.
 The base index is **cached in module scope**. Web + upload chunks form a per-request *pool*. The merged index over
 base + pool is cached by the pool's signature (LRU of 16), so repeated calls for the same topic don't rebuild it.
 
@@ -377,7 +396,10 @@ base + pool is cached by the pool's signature (LRU of 16), so repeated calls for
   branch, else `main` and then `master`.
 - Directory prefixes use the GitHub repo and tree APIs (`GITHUB_TOKEN` recommended).
 - A filter argument (`npm run ingest -- docker`) re-ingests only the matching repos and keeps the other documents.
+- Never fails the process: a repo that errors or yields no files keeps its previously ingested documents. Fetches time
+  out after 20 s, line endings are normalised, and titles come from frontmatter `title:` (any line) or the first `#`.
 - Output is raw documents only. Chunking happens at server start, so the server must be **restarted after ingesting**.
+- On Vercel, `npm run build:vercel` runs ingest before `next build`, since `data/corpus.json` is gitignored.
 
 ### How grounding is enforced
 
@@ -466,7 +488,7 @@ All keys are prefixed `feynman-lab:`.
 | `folders` | localStorage | List of folder slugs |
 | `folder:<slug>` | localStorage | `{topic, notes[], scores[], updatedAt}`. Notes can carry widget snapshots |
 | `session:<slug>` | localStorage | `{profile, lesson, rubric, sources, guardReport, teach?{difficulty, transcript, statuses, scorecard?}}` |
-| `uploads` | sessionStorage | `ExtraDoc[]` (≤ 200 KB each) sent with every request |
+| `uploads` | sessionStorage | `ExtraDoc[]` (≤ 10 files, ≤ 200k chars each; same name replaces) sent with every request |
 
 Every storage access is wrapped in try/catch, so private windows and full storage degrade to in-memory behaviour.
 "Export .md" serialises a folder (scores + notes + snapshots) into a study sheet.
@@ -534,10 +556,14 @@ import time (`LessonDraft.parse`, `RubricItem.parse`).
 | `OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY` | `lib/llm` | Ollama, Groq, Together, vLLM, LM Studio… |
 | `WEB_SEARCH` | `lib/retrieval/web.ts` | `on` (default) / `off`. Wikipedia grounding; always off in mock mode |
 | `WEB_SEARCH_LANG` | `lib/retrieval/web.ts` | Wikipedia edition (default `en`) |
+| `LLM_TIMEOUT_MS` | `lib/llm` | Fixed per-call timeout (default scales with output size, capped by the time budget) |
 | `GITHUB_TOKEN` | ingest script | Higher GitHub API limits for directory prefixes |
 
 `next.config.mjs` adds `content/**` and `data/**` to `outputFileTracingIncludes` for `/api/**`, so the corpus ships with
-serverless and standalone builds.
+serverless and standalone builds (verified in the `.nft.json` traces of the API routes).
+
+**Vercel:** Next.js preset, Build Command `npm run build:vercel`, default install/output/dev settings, Fluid compute on
+(required for the 300 s routes). Full table in README "Deploy on Vercel".
 
 ---
 
@@ -562,12 +588,15 @@ taking it further.
 5. **Web grounding is Wikipedia only.** It's good for concepts but thin on very new tools or vendor specifics. Those
    lessons fall back to labelled model knowledge. A general web-search API could plug into `webDocs()`.
 6. **Lesson latency.** The 4 + N sequential and parallel LLM calls, each with up to two repair retries, can approach
-   the 120 s route limit on slow models, especially "Deep dive" (14k output tokens).
+   the 300 s route limit on slow models, especially "Deep dive" (14k output tokens). The time budget degrades
+   gracefully (skips the fidelity audit and regeneration first), but a single lesson call slower than the budget
+   still fails. Streaming the lesson call would remove that limit.
    Option compliance (block count, interactive share) is asked for in the prompt but not enforced by the guardrail.
 7. **Dispute log is best-effort.** On read-only filesystems (serverless) it silently falls back to console output.
 8. **Lexical grading.** Both the Pupil audit (token overlap) and the mock grader (keywords) are lexical, so paraphrases
    can be under-credited. The dispute flow is the safety valve.
-9. **No tests, CI or git history in the repo.** `npm run typecheck` is the only automated check that ships with it.
+9. **No tests or CI in the repo.** `npm run typecheck` (also run by `next build`) is the only automated check that
+   ships with it.
 
 ---
 

@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Sparkle } from "@/components/Sparkle";
 import type { BlockType, GuardedBlock, LessonOptions } from "@/lib/schemas";
+import { LIMITS } from "@/lib/limits";
 import { LessonOptionsPicker } from "./LessonOptionsPicker";
 
 export type ReimagineTarget = { kind: "block"; block: GuardedBlock } | { kind: "lesson" };
@@ -118,6 +119,7 @@ export function ReimagineDialog({
           className="textarea"
           style={{ fontFamily: "var(--font)", fontSize: 15, minHeight: 96 }}
           value={text}
+          maxLength={LIMITS.instruction}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();

@@ -9,7 +9,7 @@
  *   flags ───▶ [5 Guardrail] verdict (+ [3] regenerated block / rubric patch)
  *   ✦ reimagine ─▶ [3 Architect] rewritten block | lesson ──▶ [5 Guardrail] (+ [1] new rubric for a lesson)
  */
-import { isMock, providerInfo } from "@/lib/llm";
+import { isMock, LLMError, providerInfo } from "@/lib/llm";
 import { corpusStats, getChunks, type Chunk } from "@/lib/retrieval";
 import { webSearchEnabled } from "@/lib/retrieval/web";
 import { effectiveDepth, LENGTHS, withDefaults } from "@/lib/lesson-options";
@@ -77,6 +77,10 @@ export async function startDiagnostic(topic: string, extraDocs: ExtraDoc[]) {
 async function finishLesson(topic: string, draft: LessonDraft, ctx: Context, profile: LearnerProfile, options: LessonOptions) {
   const chunks = withCited(ctx, draft.blocks);
   const guarded = await guardLesson(topic, draft, chunks, ctx.weak);
+  if (!guarded.blocks.length) {
+    const why = guarded.report.dropped.flatMap((d) => d.issues).slice(0, 3).join("; ");
+    throw new LLMError(`Every generated section failed the quality checks${why ? ` (${why})` : ""}. Please try again.`);
+  }
   const rubric = await buildRubric(topic, { ...draft, blocks: guarded.blocks }, chunks, ctx.grounding);
   const depth = effectiveDepth(options, profile.depth);
   const lesson: Lesson = {

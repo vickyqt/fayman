@@ -25,11 +25,17 @@ export function inScope(items: RubricItem[], difficulty: Difficulty): RubricItem
   return items.filter((i) => TIER_RANK[i.tier] <= TIER_RANK[difficulty]);
 }
 
+/**
+ * What to probe next: pending items first (easier tiers first), then items the
+ * learner got wrong, so gaps get a second chance. `skip` (the item just asked
+ * about) is only re-asked when nothing else is left. Undefined = all mastered.
+ */
 function nextTarget(items: RubricItem[], statuses: StatusMap, skip?: string): RubricItem | undefined {
-  const open = items
-    .filter((i) => (statuses[i.id]?.status ?? "pending") === "pending" && i.id !== skip)
-    .sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier]);
-  return open[0];
+  const status = (i: RubricItem) => statuses[i.id]?.status ?? "pending";
+  const byTier = (a: RubricItem, b: RubricItem) => TIER_RANK[a.tier] - TIER_RANK[b.tier];
+  const pending = items.filter((i) => status(i) === "pending").sort(byTier);
+  const gaps = items.filter((i) => status(i) === "gap").sort(byTier);
+  return [...pending, ...gaps].find((i) => i.id !== skip) ?? [...pending, ...gaps][0];
 }
 
 /* ---------------- mock pupil (keyword grading, scripted questions) ---------------- */
@@ -57,7 +63,10 @@ function mockTurn(difficulty: Difficulty, items: RubricItem[], statuses: StatusM
     const fixture = tcpRubric.find((r) => r.id === item.id);
     const wrong = fixture?.misconceptions?.find((m) => new RegExp(m.pattern, "i").test(text));
     if (wrong) {
-      updates.push({ id: item.id, status: "gap", evidence: `${wrong.note} ("${sentenceWith(text, "").slice(0, 120)}")` });
+      // Quote the sentence that contains the misconception (the guardrail checks the quote is the learner's).
+      const re = new RegExp(wrong.pattern, "i");
+      const said = text.split(/(?<=[.!?])\s+/).find((s) => re.test(s)) ?? text;
+      updates.push({ id: item.id, status: "gap", evidence: `${wrong.note} ("${said.slice(0, 200)}")` });
       next[item.id] = { status: "gap" };
       continue;
     }
@@ -84,7 +93,7 @@ function mockTurn(difficulty: Difficulty, items: RubricItem[], statuses: StatusM
       ? ["Ohh, okay, that makes sense!", "Got it, I think.", "Nice, that clears that up."][transcript.length % 3]
       : "Okay...";
 
-  const target = nextTarget(items, next);
+  const target = nextTarget(items, next, asked);
   if (!target) {
     return {
       reply: `${reaction} I think I can explain it back to someone now. Press "Finish" and I'll tell you what you taught me well.`,
@@ -92,7 +101,8 @@ function mockTurn(difficulty: Difficulty, items: RubricItem[], statuses: StatusM
     };
   }
   const q = tcpPupilQuestions[target.id]?.[difficulty] ?? `Can you explain ${target.concept.toLowerCase()}?`;
-  return { reply: `${reaction} ${q}`, targetId: target.id, updates };
+  const revisit = next[target.id]?.status === "gap" ? `Can we go back to ${target.concept.toLowerCase()}? ` : "";
+  return { reply: `${reaction} ${revisit}${q}`, targetId: target.id, updates };
 }
 
 /* ---------------- LLM pupil ---------------- */

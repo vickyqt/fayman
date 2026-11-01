@@ -59,7 +59,7 @@ export function chunkDoc(doc: SourceDoc, origin: Chunk["origin"]): Chunk[] {
   const sections: { heading: string; body: string[] }[] = [{ heading: doc.title, body: [] }];
   let inFence = false;
   for (const line of lines) {
-    if (/^```/.test(line)) inFence = !inFence;
+    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
     const h = !inFence && line.match(/^#{1,4}\s+(.+?)\s*#*\s*$/);
     if (h) sections.push({ heading: h[1], body: [] });
     else sections[sections.length - 1].body.push(line);
@@ -111,7 +111,10 @@ export function chunkDoc(doc: SourceDoc, origin: Chunk["origin"]): Chunk[] {
   return chunks;
 }
 
-function parseFrontmatter(raw: string): { meta: Record<string, string>; body: string } {
+function parseFrontmatter(input: string): { meta: Record<string, string>; body: string } {
+  // Normalise line endings first: Windows checkouts (core.autocrlf) give CRLF files,
+  // and an unmatched frontmatter would become a junk chunk at the top of the index.
+  const raw = input.replace(/^﻿/, "").replace(/\r\n?/g, "\n");
   const m = raw.match(/^---\n([\s\S]*?)\n---\n?/);
   if (!m) return { meta: {}, body: raw };
   const meta: Record<string, string> = {};
@@ -129,7 +132,8 @@ const STOP = new Set(
 );
 
 export function tokenize(text: string): string[] {
-  return (text.toLowerCase().match(/[a-z0-9][a-z0-9_+.-]*/g) ?? [])
+  // Unicode letters, so non-English Wikipedia editions (WEB_SEARCH_LANG) tokenize properly.
+  return (text.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_+.-]*/gu) ?? [])
     .map((t) => t.replace(/[.-]+$/, ""))
     .filter((t) => t.length > 1 && !STOP.has(t));
 }

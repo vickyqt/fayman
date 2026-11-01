@@ -77,7 +77,7 @@ export function parse(src: string): Node {
     if (/^[\d.]/.test(tok)) return { k: "num", v: Number(tok) };
     if (/^[A-Za-z_]/.test(tok)) {
       if (peek() === "(") {
-        if (!FUNCS[tok]) throw new Error(`Unknown function "${tok}"`);
+        if (!Object.hasOwn(FUNCS, tok)) throw new Error(`Unknown function "${tok}"`);
         eat("(");
         const args: Node[] = [];
         if (peek() !== ")") {
@@ -130,8 +130,9 @@ function run(n: Node, env: Record<string, number>): number {
     case "num":
       return n.v;
     case "id":
-      if (n.name in env) return env[n.name];
-      if (n.name in CONSTS) return CONSTS[n.name];
+      // Own properties only: "constructor", "toString"... must not resolve through the prototype.
+      if (Object.hasOwn(env, n.name)) return env[n.name];
+      if (Object.hasOwn(CONSTS, n.name)) return CONSTS[n.name];
       throw new Error(`Unknown variable "${n.name}"`);
     case "un": {
       const a = run(n.a, env);
@@ -165,12 +166,15 @@ function run(n: Node, env: Record<string, number>): number {
   throw new Error("Bad expression node");
 }
 
+/** Parsed-expression cache, bounded: the server sees new model-written formulas forever. */
 const cache = new Map<string, Node>();
+const CACHE_MAX = 500;
 
 export function evaluate(src: string, env: Record<string, number>): number {
   let ast = cache.get(src);
   if (!ast) {
     ast = parse(src);
+    if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value as string);
     cache.set(src, ast);
   }
   return run(ast, env);

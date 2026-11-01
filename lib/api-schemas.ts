@@ -12,12 +12,22 @@ import {
   RubricItem,
   TranscriptMsg,
 } from "@/lib/schemas";
+import { LIMITS } from "@/lib/limits";
 
-const topic = z.string().trim().min(2).max(120);
-const extraDocs = z.array(ExtraDoc).max(10).default([]);
+const topic = z.string().trim().min(2).max(LIMITS.topic);
+const extraDocs = z.array(ExtraDoc).max(LIMITS.uploads).default([]);
 const statuses = z
   .record(z.string(), z.object({ status: z.enum(["pending", "mastered", "gap"]), evidence: z.string().optional() }))
   .default({});
+/**
+ * Long teach-backs are fine: the client sends the recent window, and anything
+ * older than LIMITS.transcript messages is dropped here rather than rejected.
+ * Rubric statuses carry the earlier progress.
+ */
+const transcript = z
+  .array(TranscriptMsg)
+  .max(LIMITS.transcript * 5)
+  .transform((t) => t.slice(-LIMITS.transcript));
 
 export const DiagnosticReq = z.object({ topic, extraDocs });
 
@@ -34,7 +44,7 @@ export const ReimagineReq = z
     topic,
     scope: z.enum(["block", "lesson"]),
     /** What the learner imagined. Optional for a whole-lesson rebuild that only changes options. */
-    instruction: z.string().trim().max(1200).default(""),
+    instruction: z.string().trim().max(LIMITS.instruction).default(""),
     block: LessonBlock.optional(),
     preferType: z.enum(BLOCK_TYPES).optional(),
     outline: z.array(z.object({ id: z.string().max(64), type: z.string().max(20), title: z.string().max(200) })).max(16).default([]),
@@ -51,7 +61,7 @@ export const PupilReq = z.object({
   difficulty: Difficulty,
   rubric: z.array(RubricItem).min(1).max(10),
   statuses,
-  transcript: z.array(TranscriptMsg).max(80),
+  transcript,
 });
 
 export const NoteReq = z.object({
@@ -64,10 +74,10 @@ export const NoteReq = z.object({
 export const DisputeReq = z.object({
   topic,
   kind: z.enum(["block", "grading"]),
-  complaint: z.string().trim().min(3).max(1000),
+  complaint: z.string().trim().min(3).max(LIMITS.complaint),
   block: LessonBlock.optional(),
   rubricItem: RubricItem.optional(),
   currentStatus: z.object({ status: z.enum(["pending", "mastered", "gap"]), evidence: z.string().optional() }).optional(),
-  transcript: z.array(TranscriptMsg).max(80).optional(),
+  transcript: transcript.optional(),
   extraDocs,
 });

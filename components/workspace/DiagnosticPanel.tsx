@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { DEPTHS, diagnosticScore, levelFromScore } from "@/lib/lesson-options";
 import { getPrefs, setPrefs } from "@/lib/client/store";
+import { LIMITS } from "@/lib/limits";
 import type { DiagnosticAnswer, DiagnosticQuestion, LessonOptions } from "@/lib/schemas";
 import { LessonOptionsPicker } from "./LessonOptionsPicker";
 
@@ -13,6 +14,7 @@ export function DiagnosticPanel({
   sources,
   weakSources,
   notice,
+  initial,
   onSubmit,
 }: {
   topic: string;
@@ -20,12 +22,20 @@ export function DiagnosticPanel({
   sources: { id: string; label: string; url: string; origin?: string }[];
   weakSources: boolean;
   notice?: string;
+  /** Previous answers and options, e.g. when returning after a failed lesson build. */
+  initial?: { answers: DiagnosticAnswer[]; options: LessonOptions };
   onSubmit: (answers: DiagnosticAnswer[], options: LessonOptions) => void;
 }) {
-  const [choice, setChoice] = useState<Record<string, number>>({});
-  const [why, setWhy] = useState<Record<string, string>>({});
-  const [options, setOptions] = useState<LessonOptions | null>(null);
-  useEffect(() => setOptions(getPrefs()), []);
+  const [choice, setChoice] = useState<Record<string, number>>(() =>
+    Object.fromEntries((initial?.answers ?? []).map((a) => [a.questionId, a.choice])),
+  );
+  const [why, setWhy] = useState<Record<string, string>>(() =>
+    Object.fromEntries((initial?.answers ?? []).filter((a) => a.explanation).map((a) => [a.questionId, a.explanation])),
+  );
+  const [options, setOptions] = useState<LessonOptions | null>(initial?.options ?? null);
+  useEffect(() => {
+    if (!initial) setOptions(getPrefs()); // client-only: localStorage
+  }, [initial]);
 
   const answered = Object.keys(choice).length;
   const done = questions.every((q) => choice[q.id] !== undefined);
@@ -81,6 +91,7 @@ export function DiagnosticPanel({
                 className="input"
                 placeholder="Optional: why? (one line helps the assessor spot misconceptions)"
                 value={why[q.id] ?? ""}
+                maxLength={LIMITS.diagnosticWhy}
                 onChange={(e) => setWhy((w) => ({ ...w, [q.id]: e.target.value }))}
               />
             </div>

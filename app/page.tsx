@@ -2,7 +2,8 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { deleteFolder, getUploads, listFolders, setUploads, type Folder } from "@/lib/client/store";
+import { deleteFolder, folderTopic, getUploads, listFolders, setUploads, type Folder } from "@/lib/client/store";
+import { LIMITS } from "@/lib/limits";
 import type { ExtraDoc } from "@/lib/schemas";
 import { ThemeToggle } from "@/components/ThemeToggle";
 
@@ -21,6 +22,7 @@ export default function Home() {
   const [folders, setFolders] = useState<Folder[]>([]);
   const [uploads, setUp] = useState<ExtraDoc[]>([]);
   const [status, setStatus] = useState<Status | null>(null);
+  const [uploadNote, setUploadNote] = useState("");
 
   useEffect(() => {
     setFolders(listFolders());
@@ -33,15 +35,33 @@ export default function Home() {
 
   const go = (t: string) => t.trim() && router.push(`/study?topic=${encodeURIComponent(t.trim())}`);
 
-  async function addFiles(files: FileList | null) {
-    if (!files) return;
+  async function addFiles(input: HTMLInputElement) {
+    const files = Array.from(input.files ?? []);
+    input.value = ""; // so picking the same file again still fires onChange
+    if (!files.length) return;
     const docs: ExtraDoc[] = [...uploads];
-    for (const f of Array.from(files)) {
-      if (!/\.(md|mdx|txt|markdown)$/i.test(f.name)) continue;
-      docs.push({ name: f.name, text: (await f.text()).slice(0, 200_000) });
+    const skipped: string[] = [];
+    let truncated = 0;
+    for (const f of files) {
+      if (!/\.(md|mdx|txt|markdown)$/i.test(f.name)) {
+        skipped.push(`${f.name} (not .md/.txt)`);
+        continue;
+      }
+      const raw = await f.text();
+      if (raw.length > LIMITS.uploadChars) truncated++;
+      const doc = { name: f.name.slice(0, 200), text: raw.slice(0, LIMITS.uploadChars) };
+      const same = docs.findIndex((d) => d.name === doc.name);
+      if (same >= 0) docs[same] = doc; // re-uploading a file replaces it
+      else if (docs.length < LIMITS.uploads) docs.push(doc);
+      else skipped.push(`${f.name} (limit is ${LIMITS.uploads} files)`);
     }
     setUp(docs);
     setUploads(docs);
+    const notes = [
+      skipped.length ? `Skipped ${skipped.join(", ")}.` : "",
+      truncated ? `${truncated} file(s) were cut to the first ${LIMITS.uploadChars / 1000}k characters.` : "",
+    ].filter(Boolean);
+    setUploadNote(notes.join(" "));
   }
 
   return (
@@ -91,6 +111,7 @@ export default function Home() {
               className="input"
               value={topic}
               onChange={(e) => setTopic(e.target.value)}
+              maxLength={LIMITS.topic}
               placeholder="Any topic, e.g. Kafka consumer groups, CRDTs, TCP handshake"
               autoComplete="off"
             />
@@ -107,9 +128,21 @@ export default function Home() {
           </div>
           <div style={{ borderTop: "1.5px dashed var(--edge)", paddingTop: 12 }}>
             <label className="small" style={{ fontWeight: 600 }}>
-              Coursework / syllabus notes (.md, .txt)
-              <input type="file" accept=".md,.mdx,.txt,.markdown" multiple onChange={(e) => addFiles(e.target.files)} style={{ display: "block", marginTop: 6 }} />
+              Coursework / syllabus notes (.md, .txt, up to {LIMITS.uploads} files)
+              <input
+                type="file"
+                accept=".md,.mdx,.txt,.markdown"
+                multiple
+                disabled={uploads.length >= LIMITS.uploads}
+                onChange={(e) => addFiles(e.currentTarget)}
+                style={{ display: "block", marginTop: 6 }}
+              />
             </label>
+            {uploadNote && (
+              <p className="small muted" style={{ margin: "6px 0 0" }} role="status">
+                {uploadNote}
+              </p>
+            )}
             {uploads.length > 0 && (
               <div className="row small" style={{ marginTop: 8 }}>
                 {uploads.map((u) => (
@@ -122,6 +155,7 @@ export default function Home() {
                   onClick={() => {
                     setUp([]);
                     setUploads([]);
+                    setUploadNote("");
                   }}
                 >
                   clear
@@ -165,7 +199,7 @@ export default function Home() {
               const last = f.scores[f.scores.length - 1];
               return (
                 <div key={f.slug} className="row">
-                  <Link className="folder" style={{ flex: 1 }} href={`/study?topic=${encodeURIComponent(f.topic)}`}>
+                  <Link className="folder" style={{ flex: 1 }} href={`/study?topic=${encodeURIComponent(folderTopic(f))}`}>
                     <strong style={{ flex: 1 }}>{f.topic}</strong>
                     <span className="tag">{f.notes.length} notes</span>
                     {last && <span className={`tag ${last.score >= 70 ? "green" : "red"}`}>last teach-back {last.score}%</span>}

@@ -14,7 +14,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { completeJSON, isMock } from "@/lib/llm";
+import { completeJSON, isMock, timeLeft } from "@/lib/llm";
 import { checkExpr } from "@/lib/expr";
 import { chunkMap, tokenize, type Chunk } from "@/lib/retrieval";
 import {
@@ -121,16 +121,19 @@ export function checkBlock(input: LessonBlock): Check {
           fix("Challenge had no valid edges; removed");
         }
       }
-      // Accessibility: spread nodes that overlap so labels stay readable.
-      for (let i = 0; i < block.nodes.length; i++)
-        for (let j = 0; j < i; j++) {
-          const a = block.nodes[i];
-          const b = block.nodes[j];
-          if (Math.abs(a.x - b.x) < 150 && Math.abs(a.y - b.y) < 60) {
-            a.y = b.y + 90;
-            repaired = true;
-          }
+      // Accessibility: spread nodes that overlap so labels stay readable. A moved node is
+      // re-checked against every node already placed, so a nudge can't create a new overlap.
+      const overlaps = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+        Math.abs(a.x - b.x) < 150 && Math.abs(a.y - b.y) < 60;
+      for (let i = 1; i < block.nodes.length; i++) {
+        const a = block.nodes[i];
+        for (let tries = 0; tries < block.nodes.length; tries++) {
+          const hit = block.nodes.slice(0, i).find((b) => overlaps(a, b));
+          if (!hit) break;
+          a.y = hit.y + 90;
+          repaired = true;
         }
+      }
       if (block.nodes.length < 2) return { block: null, issues: [...issues, "Diagram has fewer than 2 nodes"], repaired };
       break;
     }
@@ -210,6 +213,24 @@ export interface GuardReport {
   unverified: string[];
   fidelityRan: boolean;
   weakSources: boolean;
+  /** Optional LLM steps skipped so the request could finish inside its time budget. */
+  skippedForTime: string[];
+}
+
+/**
+ * Time the rest of a lesson request still needs after the guardrail (the rubric
+ * call, plus headroom). Optional checks only start when they can finish first.
+ */
+const FIDELITY_NEEDS_MS = 75_000;
+const REGEN_NEEDS_MS = 60_000;
+
+/** Deduplicate a block id without breaking the 64-char id limit the API schemas enforce. */
+function uniqueId(id: string, taken: Set<string>): string {
+  if (!taken.has(id)) return id;
+  for (let n = 2; ; n++) {
+    const candidate = `${id.slice(0, 60)}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
 }
 
 export async function guardLesson(
@@ -227,14 +248,15 @@ export async function guardLesson(
     unverified: [],
     fidelityRan: false,
     weakSources,
+    skippedForTime: [],
   };
 
   // 1. unique ids + structural checks
   const ids = new Set<string>();
   const checked: { block: LessonBlock; issues: string[]; repaired: boolean }[] = [];
   for (const raw of draft.blocks) {
-    let b = raw;
-    if (ids.has(b.id)) b = { ...b, id: `${b.id}-${ids.size}` };
+    const id = uniqueId(raw.id, ids);
+    const b = id === raw.id ? raw : { ...raw, id };
     ids.add(b.id);
     const c = checkBlock(b);
     if (!c.block) {
@@ -252,29 +274,38 @@ export async function guardLesson(
   let fidelity: Awaited<ReturnType<typeof fidelityCheck>> | null = null;
   const auditable = checked.filter((c) => !weakSources || c.block.sourceIds.some((id) => map.has(id)));
   if (!isMock() && chunks.length && auditable.length) {
-    try {
-      fidelity = await fidelityCheck(auditable.map((c) => c.block), chunks);
-      report.fidelityRan = true;
-    } catch (e) {
-      console.warn("[guardrail] fidelity check skipped:", (e as Error).message);
+    if (timeLeft() < FIDELITY_NEEDS_MS) {
+      report.skippedForTime.push("fidelity audit");
+      console.warn("[guardrail] fidelity check skipped: not enough time left in this request");
+    } else {
+      try {
+        fidelity = await fidelityCheck(auditable.map((c) => c.block), chunks);
+        report.fidelityRan = true;
+      } catch (e) {
+        console.warn("[guardrail] fidelity check skipped:", (e as Error).message);
+      }
     }
   }
 
   // 3. regenerate unsupported blocks once (in parallel), re-check them
+  const canRegenerate = timeLeft() >= REGEN_NEEDS_MS;
+  if (!canRegenerate && [...(fidelity?.values() ?? [])].some((f) => !f.supported)) report.skippedForTime.push("regeneration");
   await Promise.all(
     checked.map(async (c, i) => {
       const f = fidelity?.get(c.block.id);
       if (!f || f.supported) return;
-      try {
-        const regen = await regenerateBlock(topic, c.block, f.issues, chunks, grounding);
-        const rc = checkBlock({ ...regen, id: c.block.id } as LessonBlock);
-        if (rc.block) {
-          checked[i] = { block: rc.block, issues: [`Regenerated after fidelity check: ${f.issues.join("; ")}`], repaired: true };
-          report.regenerated.push(c.block.id);
-          return;
+      if (canRegenerate) {
+        try {
+          const regen = await regenerateBlock(topic, c.block, f.issues, chunks, grounding);
+          const rc = checkBlock({ ...regen, id: c.block.id } as LessonBlock);
+          if (rc.block) {
+            checked[i] = { block: rc.block, issues: [`Regenerated after fidelity check: ${f.issues.join("; ")}`], repaired: true };
+            report.regenerated.push(c.block.id);
+            return;
+          }
+        } catch (e) {
+          console.warn("[guardrail] regeneration failed:", (e as Error).message);
         }
-      } catch (e) {
-        console.warn("[guardrail] regeneration failed:", (e as Error).message);
       }
       c.issues.push(...f.issues.map((x) => `Possibly unsupported: ${x}`));
       (c as { unsupported?: boolean }).unsupported = true;
@@ -320,17 +351,33 @@ function overlap(evidence: string, learnerText: string): number {
   return ev.filter((t) => said.has(t)).length / ev.length;
 }
 
+/** The quoted part of an evidence string (`note ("learner words")`), or all of it when nothing is quoted. */
+function quotedPart(evidence: string): string {
+  const quotes = [...evidence.matchAll(/["“]([^"”]{8,})["”]/g)];
+  return quotes.length ? quotes[quotes.length - 1][1] : evidence;
+}
+
 /**
- * Keeps the Pupil honest: a concept can only turn green if the evidence is
- * something the learner actually said, and unknown rubric ids are dropped.
+ * Keeps the Pupil honest, in both directions:
+ *  - a concept only turns green if the evidence is something the learner actually said;
+ *  - a concept only turns red if the latest message really says something wrong (the
+ *    quoted words are the learner's) or it dodged the question the Pupil just asked about it.
+ * Unknown rubric ids are dropped.
  */
 export function auditPupilTurn(turn: PupilTurn, items: RubricItem[], transcript: TranscriptMsg[]): PupilTurn {
   const valid = new Set(items.map((i) => i.id));
   const learnerText = transcript.filter((m) => m.role === "learner").map((m) => m.text).join("\n");
+  const latest = [...transcript].reverse().find((m) => m.role === "learner")?.text ?? "";
+  const lastLearner = transcript.map((m) => m.role).lastIndexOf("learner");
+  const asked = [...transcript.slice(0, Math.max(0, lastLearner))].reverse().find((m) => m.role === "pupil")?.targetId;
   const updates = turn.updates.filter((u) => {
     if (!valid.has(u.id)) return false;
     if (u.status === "mastered" && overlap(u.evidence, learnerText) < 0.5) {
       console.warn(`[guardrail] dropped ungrounded mastery for ${u.id}: "${u.evidence}"`);
+      return false;
+    }
+    if (u.status === "gap" && u.id !== asked && overlap(quotedPart(u.evidence), latest) < 0.5) {
+      console.warn(`[guardrail] dropped ungrounded gap for ${u.id}: "${u.evidence}"`);
       return false;
     }
     return true;
@@ -376,6 +423,23 @@ Return JSON {"verdict": "upheld"|"rejected", "explanation": string (addressed to
  "action": "regenerate_block"|"recalibrate_rubric"|"none",
  "rubricPatch"?: {"id", "expectation", "keywords"} (when the rubric item itself was unfair or unclear),
  "regradeTo"?: "mastered"|"gap"|"pending" (for grading disputes, the fair status given the transcript)}.`;
+
+/**
+ * A verdict only changes something when it is upheld, and only in ways that fit
+ * the dispute: a rejected flag never regrades or patches anything, a block flag
+ * never touches grading, and a grading dispute never regenerates a block.
+ */
+export function normalizeVerdict(v: DisputeVerdict, kind: DisputeInput["kind"]): DisputeVerdict {
+  if (v.verdict === "rejected") return { verdict: v.verdict, explanation: v.explanation, action: "none" };
+  if (kind === "block") return { verdict: v.verdict, explanation: v.explanation, action: v.action === "regenerate_block" ? v.action : "none" };
+  return {
+    verdict: v.verdict,
+    explanation: v.explanation,
+    action: v.action === "regenerate_block" ? "none" : v.action,
+    ...(v.rubricPatch ? { rubricPatch: v.rubricPatch } : {}),
+    ...(v.regradeTo ? { regradeTo: v.regradeTo } : {}),
+  };
+}
 
 export async function resolveDispute(input: DisputeInput, chunks: Chunk[], weakSources = false): Promise<DisputeResult> {
   const logId = `d_${Date.now().toString(36)}`;
@@ -431,6 +495,7 @@ export async function resolveDispute(input: DisputeInput, chunks: Chunk[], weakS
     );
   }
 
+  verdict = normalizeVerdict(verdict, input.kind);
   const result: DisputeResult = { ...verdict, logId };
 
   if (verdict.action === "regenerate_block" && input.block) {
@@ -441,6 +506,8 @@ export async function resolveDispute(input: DisputeInput, chunks: Chunk[], weakS
     if (block) {
       block.verification.issues.unshift(`Regenerated after learner flag: "${input.complaint.slice(0, 120)}"`);
       result.block = block;
+    } else {
+      result.explanation += " I couldn't produce a version that passed the quality checks, so the section is unchanged; try reimagining it with ✦.";
     }
   }
   if (input.rubricItem && verdict.rubricPatch && verdict.rubricPatch.id === input.rubricItem.id) {

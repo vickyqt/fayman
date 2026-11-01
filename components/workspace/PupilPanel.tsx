@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/client/api";
 import { canListen, listen, speak, stopSpeaking, type Dictation } from "@/lib/client/speech";
 import type { Session } from "@/lib/client/store";
+import { LIMITS } from "@/lib/limits";
 import type { Difficulty, PupilTurn, RubricItem, RubricStatus, Scorecard, TranscriptMsg } from "@/lib/schemas";
 
 type Teach = NonNullable<Session["teach"]>;
@@ -57,7 +58,9 @@ export function PupilPanel({
     difficulty: t.difficulty,
     rubric: session.rubric,
     statuses: t.statuses,
-    transcript: t.transcript,
+    // Long conversations keep working: the Pupil sees the recent window, and the
+    // statuses carry everything already graded.
+    transcript: t.transcript.slice(-LIMITS.transcript),
   });
 
   async function start(difficulty: Difficulty) {
@@ -129,7 +132,7 @@ export function PupilPanel({
     const base = input.trim() ? input.trim() + " " : "";
     setMic(true);
     dictation.current = listen(
-      (text) => setInput(base + text),
+      (text) => setInput((base + text).slice(0, LIMITS.message)),
       (e) => {
         setMic(false);
         dictation.current = null;
@@ -297,6 +300,7 @@ export function PupilPanel({
               className="textarea"
               placeholder={teach.transcript.length <= 1 ? "Explain it like you're talking to a friend…" : "Answer the Pupil…"}
               value={input}
+              maxLength={LIMITS.message}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();

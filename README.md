@@ -4,7 +4,8 @@
 Brilliant-style interactive lesson grounded in trusted GitHub repos, and a Pupil agent tests you with the
 Feynman technique: you explain, it probes, and a live rubric turns green or red.
 
-Hackathon MVP · Next.js 15 + TypeScript · provider-agnostic LLM layer · runs fully offline in demo mode.
+Hackathon MVP · Next.js 16 + React 19 + zod 4 + TypeScript · provider-agnostic LLM layer · runs fully offline in demo mode.
+Requires Node.js 20.9 or newer.
 
 ---
 
@@ -32,7 +33,13 @@ Set one provider in `.env.local`:
 | `mock` | nothing | scripted TCP lesson |
 
 Model names change often; set `LLM_MODEL` to whatever your account offers. Adapters are plain `fetch`
-calls in `lib/llm/index.ts`, so adding a provider is ~30 lines.
+calls in `lib/llm/index.ts`, so adding a provider is ~30 lines. OpenAI reasoning models (`o*`, `gpt-5*`) work too: the
+adapter sends `max_completion_tokens` and leaves their temperature alone.
+
+Each model call gets a timeout sized to its output (60 s up to 240 s for a Deep-dive lesson), always capped by what is
+left of the route's `maxDuration`. When time runs short, the optional fidelity audit and block regeneration are skipped
+(listed in the lesson's guard report as `skippedForTime`) instead of the request being killed. `LLM_TIMEOUT_MS` sets
+a fixed per-call timeout if you need one.
 
 ### Ground lessons in trusted repos
 
@@ -43,11 +50,13 @@ npm run ingest -- docker  # only repos whose name contains "docker"
 
 Exact file paths are downloaded from `raw.githubusercontent.com` (no API rate limit). Directory prefixes use
 the GitHub tree API, so set `GITHUB_TOKEN` if you list folders. Restart the server after ingesting.
+Ingest never fails the process: a repo that can't be fetched keeps its previously ingested files, so it is safe to run
+in a deploy build (see [Deploy on Vercel](#deploy-on-vercel)).
 The default list covers the suggested topics: system-design-primer, react-fiber-architecture, react.dev,
 docker/docs networking, cstack/db_tutorial (B-trees), RAG_Techniques, and MDN's TCP pages.
 
-Learners can also upload `.md` / `.txt` syllabus notes on the home page; they're ranked alongside the repos
-for that browser session.
+Learners can also upload `.md` / `.txt` syllabus notes on the home page (up to 10 files, 200k characters each;
+re-uploading a file replaces it). They're ranked alongside the repos for that browser session.
 
 ### Any topic
 
@@ -67,6 +76,37 @@ labelled **◇ model knowledge** instead of being presented as sourced.
 ### Theme
 
 Light, dark or follow the OS: toggle in the top bar (saved per browser, applied before first paint).
+
+---
+
+## Deploy on Vercel
+
+Vercel detects the project as **Next.js**. Use these project settings (Settings → Build and Deployment):
+
+| Setting | Value |
+|---|---|
+| Framework Preset | **Next.js** |
+| Build Command | `npm run build:vercel` (ingests the trusted repos, then `next build`) |
+| Output Directory | leave empty: the Next.js preset handles it (`.next`). Don't override it |
+| Install Command | `npm install` (the default; `npm ci` also works, `package-lock.json` is committed) |
+| Development Command | `next dev` (the default; only used by `vercel dev`) |
+| Node.js Version | 22.x or 24.x (Next 16 needs ≥ 20.9; `package.json` declares it in `engines`) |
+
+Why `build:vercel`: `data/corpus.json` is gitignored, so a plain `next build` deploys only the seed notes and
+Wikipedia. `npm run build:vercel` runs `npm run ingest` first; `next.config.mjs` traces `data/**` and `content/**`
+into the API functions. If the repos can't be fetched, ingest just warns and the build still succeeds.
+
+**Environment variables** (Settings → Environment Variables): `LLM_PROVIDER` plus the matching key
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` or `OPENAI_COMPATIBLE_BASE_URL`/`_API_KEY`), and optionally
+`LLM_MODEL`, `WEB_SEARCH`, `WEB_SEARCH_LANG`, `LLM_TIMEOUT_MS`, and `GITHUB_TOKEN` (only needed if you list folders
+in `config/trusted-repos.json`). Without `LLM_PROVIDER` the deployment runs the offline demo.
+
+**Function duration:** `/api/lesson` and `/api/reimagine` declare `maxDuration = 300` (dispute 120 s, others 30–60 s).
+That needs **Fluid compute** (on by default for new projects; Settings → Functions), which allows up to 300 s on Hobby
+and 800 s on Pro. With Fluid compute off, Hobby is limited to 60 s and long lessons will fail.
+
+On Vercel, `data/disputes.jsonl` can't be written (read-only filesystem), so dispute decisions are recorded in the
+function logs instead.
 
 ---
 
@@ -106,11 +146,12 @@ artifacts (all defined with zod in `lib/schemas/index.ts`).
   + heading anchor). Unknown ids are removed. A block with no real source is labelled **unverified**.
 - **Fidelity audit.** One LLM pass checks every block's claims against its sources; unsupported blocks
   are regenerated once, otherwise flagged.
-- **Honest grading.** A concept only turns green if the Pupil's quoted evidence overlaps what the learner
-  actually said. Ungrounded "mastered" updates are dropped.
+- **Honest grading, both ways.** A concept only turns green if the Pupil's quoted evidence overlaps what the learner
+  actually said. It only turns red if the latest message really says something wrong (the quote is the learner's) or
+  dodged the question the Pupil just asked about it. Ungrounded updates are dropped.
 - **Learner advocacy.** "⚑ Flag issue" on any block and "Unfair?" on any red rubric item send a dispute;
   the agent regenerates the block, rewrites the rubric item or re-grades, and appends to
-  `data/disputes.jsonl`.
+  `data/disputes.jsonl`. Only an upheld dispute changes anything: a rejected one never regrades or patches.
 - **Render isolation.** Each block has its own error boundary with a "Report & regenerate" button, so one
   bad widget never takes down the lesson.
 
@@ -164,6 +205,7 @@ lib/orchestrator.ts     sequences agents; the only module routes call
 lib/llm/                provider-agnostic adapter + validated JSON with self-repair
 lib/retrieval/          markdown chunking (heading-anchored), BM25 index, corpus loading, Wikipedia search (web.ts)
 lib/lesson-options.ts   what Length / Depth / Interactivity mean (shared by UI, prompts and mock)
+lib/limits.ts           request size limits shared by the API schemas and the UI
 lib/schemas/            zod contracts for every artifact
 lib/fixtures/tcp.ts     offline demo content (also a reference for good agent output)
 content/seed/           curated seed notes (TCP, cites IETF RFCs)

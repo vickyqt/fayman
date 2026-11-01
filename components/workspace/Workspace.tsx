@@ -27,6 +27,7 @@ import type {
   RubricItem,
 } from "@/lib/schemas";
 import { DEPTHS, describeOptions } from "@/lib/lesson-options";
+import { LIMITS } from "@/lib/limits";
 import { BlockFrame } from "@/components/blocks/BlockFrame";
 import type { Focus } from "@/components/blocks/types";
 import { Sparkle } from "@/components/Sparkle";
@@ -58,16 +59,27 @@ interface Toast {
   action?: { label: string; run: () => void };
 }
 
+interface DiagnosticStage {
+  kind: "diagnostic";
+  questions: DiagnosticQuestion[];
+  sources: { id: string; label: string; url: string; origin?: string }[];
+  weakSources: boolean;
+  notice?: string;
+  /** Answers and options to pre-fill (coming back after a failed lesson build). */
+  initial?: { answers: DiagnosticAnswer[]; options: LessonOptions };
+}
+
 type Stage =
   | { kind: "loading"; label: string; steps: string[] }
-  | { kind: "error"; message: string }
   | {
-      kind: "diagnostic";
-      questions: DiagnosticQuestion[];
-      sources: { id: string; label: string; url: string; origin?: string }[];
-      weakSources: boolean;
-      notice?: string;
+      kind: "error";
+      message: string;
+      /** Repeat the step that failed (default: restart the diagnostic). */
+      retry?: () => void;
+      /** Return to the diagnostic answers without rebuilding. */
+      back?: () => void;
     }
+  | DiagnosticStage
   | { kind: "ready" };
 
 interface DisputeTarget {
@@ -125,6 +137,9 @@ export function Workspace({ topic }: { topic: string }) {
     }
   }, [topic]);
 
+  // React StrictMode (dev) runs mount effects twice; boot once so the diagnostic
+  // (an LLM call) isn't requested twice. A new topic remounts via key, resetting this.
+  const booted = useRef(false);
   useEffect(() => {
     if (window.innerWidth < 980) setNotesOpen(false); // drawer overlays the lesson on small screens
     setFolder(getFolder(topic));
@@ -132,16 +147,20 @@ export function Workspace({ topic }: { topic: string }) {
       .then((r) => r.json())
       .then((s: { provider?: string }) => setOffline(s.provider === "mock"))
       .catch(() => {});
-    const saved = getSession(topic);
-    if (saved) {
-      sessionRef.current = saved;
-      setSession(saved);
-      setStage({ kind: "ready" });
-    } else startDiagnostic();
+    if (!booted.current) {
+      booted.current = true;
+      const saved = getSession(topic);
+      if (saved) {
+        sessionRef.current = saved;
+        setSession(saved);
+        setStage({ kind: "ready" });
+      } else startDiagnostic();
+    }
     return () => stopSpeaking();
   }, [topic, startDiagnostic]);
 
-  async function submitDiagnostic(questions: DiagnosticQuestion[], answers: DiagnosticAnswer[], options: LessonOptions) {
+  async function submitDiagnostic(diag: DiagnosticStage, answers: DiagnosticAnswer[], options: LessonOptions) {
+    const { questions } = diag;
     setStage({
       kind: "loading",
       label: "Building your interactive lesson",
@@ -167,7 +186,13 @@ export function Workspace({ topic }: { topic: string }) {
       setStage({ kind: "ready" });
       window.scrollTo({ top: 0 });
     } catch (e) {
-      setStage({ kind: "error", message: (e as Error).message });
+      // Keep the learner's answers: retry the build, or go back and change them.
+      setStage({
+        kind: "error",
+        message: (e as Error).message,
+        retry: () => submitDiagnostic(diag, answers, options),
+        back: () => setStage({ ...diag, initial: { answers, options } }),
+      });
     }
   }
 
@@ -194,7 +219,9 @@ export function Workspace({ topic }: { topic: string }) {
   );
 
   const updateFolder = (f: Folder) => {
-    const next = { ...f, topic: session?.lesson.topic ?? topic };
+    // Keep the topic the folder was opened with: the home page links to /study?topic=<folder.topic>,
+    // which must slugify back to this folder (offline, lesson.topic is always the TCP demo's title).
+    const next = { ...f, topic };
     saveFolder(next);
     setFolder(next);
   };
@@ -342,14 +369,15 @@ export function Workspace({ topic }: { topic: string }) {
         block: target.block ? rawBlock(target.block) : undefined,
         rubricItem: target.item,
         currentStatus: target.item ? session.teach?.statuses[target.item.id] : undefined,
-        transcript: session.teach?.transcript,
+        transcript: session.teach?.transcript.slice(-LIMITS.transcript),
         extraDocs: getUploads(),
       });
       if (r.block) replaceBlock(r.block);
       update((cur) => {
         const next: Session = structuredClone(cur);
         if (r.rubricItem) next.rubric = next.rubric.map((it) => (it.id === r.rubricItem!.id ? r.rubricItem! : it));
-        if (r.regradeTo && target.item && next.teach)
+        // Only an upheld dispute changes the grade (the server also strips regrades from rejections).
+        if (r.verdict === "upheld" && r.regradeTo && target.item && next.teach)
           next.teach.statuses[target.item.id] = { status: r.regradeTo, evidence: "Re-graded after review" };
         return next;
       });
@@ -439,9 +467,21 @@ export function Workspace({ topic }: { topic: string }) {
                   Check <code>LLM_PROVIDER</code> and the API key in <code>.env.local</code>, or set <code>LLM_PROVIDER=mock</code> for the offline
                   demo.
                 </p>
-                <button className="btn primary" onClick={startDiagnostic}>
-                  Try again
-                </button>
+                <div className="row">
+                  <button className="btn primary" onClick={stage.retry ?? startDiagnostic}>
+                    Try again
+                  </button>
+                  {stage.back && (
+                    <button className="btn" onClick={stage.back}>
+                      Back to my answers
+                    </button>
+                  )}
+                  {stage.retry && (
+                    <button className="btn ghost" onClick={startDiagnostic}>
+                      New diagnostic
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -453,7 +493,8 @@ export function Workspace({ topic }: { topic: string }) {
               sources={stage.sources}
               weakSources={stage.weakSources}
               notice={stage.notice}
-              onSubmit={(a, o) => submitDiagnostic(stage.questions, a, o)}
+              initial={stage.initial}
+              onSubmit={(a, o) => submitDiagnostic(stage, a, o)}
             />
           )}
 
@@ -661,6 +702,7 @@ function DisputeDialog({
           className="textarea"
           style={{ fontFamily: "var(--font)" }}
           value={text}
+          maxLength={LIMITS.complaint}
           onChange={(e) => setText(e.target.value)}
           placeholder="What's wrong? Be specific and the agent can fix it."
           autoFocus
