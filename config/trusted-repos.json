@@ -1,0 +1,63 @@
+{
+  "_comment": "Curated, trusted sources the Archivist is allowed to ground lessons in. `include` are path prefixes; only .md/.mdx files are ingested. Run `npm run ingest` after editing.",
+  "repos": [
+    {
+      "repo": "donnemartin/system-design-primer",
+      "include": [
+        "README.md"
+      ],
+      "maxFiles": 1
+    },
+    {
+      "repo": "acdlite/react-fiber-architecture",
+      "include": [
+        "README.md"
+      ],
+      "maxFiles": 1
+    },
+    {
+      "repo": "reactjs/react.dev",
+      "include": [
+        "src/content/learn/preserving-and-resetting-state.md",
+        "src/content/learn/render-and-commit.md",
+        "src/content/learn/state-as-a-snapshot.md"
+      ],
+      "maxFiles": 3
+    },
+    {
+      "repo": "docker/docs",
+      "include": [
+        "content/manuals/engine/network/_index.md",
+        "content/manuals/engine/network/drivers/bridge.md",
+        "content/manuals/engine/network/drivers/overlay.md",
+        "content/manuals/engine/network/drivers/host.md"
+      ],
+      "maxFiles": 4
+    },
+    {
+      "repo": "cstack/db_tutorial",
+      "include": [
+        "_parts/part7.md",
+        "_parts/part8.md",
+        "_parts/part10.md"
+      ],
+      "maxFiles": 3
+    },
+    {
+      "repo": "NirDiamant/RAG_Techniques",
+      "include": [
+        "README.md"
+      ],
+      "maxFiles": 1
+    },
+    {
+      "repo": "mdn/content",
+      "include": [
+        "files/en-us/glossary/tcp_handshake/index.md",
+        "files/en-us/glossary/tcp/index.md",
+        "files/en-us/web/http/guides/connection_management_in_http_1.x/index.md"
+      ],
+      "maxFiles": 3
+    }
+  ]
+}
